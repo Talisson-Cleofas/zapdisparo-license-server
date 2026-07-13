@@ -10,6 +10,7 @@
     "cors": "latest",
     "dotenv": "latest",
     "express": "latest",
-    "mongoose": "latest"
+    "mongoose": "latest",
+    "nodemailer": "^6.10.1"
   }
 }
