@@ -6,7 +6,7 @@
     "start": "node src/server.js",
     "dev": "node src/server.js",
     "keys:generate": "node scripts/generate-license-keys.js",
-    "test": "node --check src/server.js && node --check scripts/generate-license-keys.js"
+    "test": "node --check src/server.js && node --check scripts/generate-license-keys.js && node --test"
   },
   "dependencies": {
     "cors": "latest",
