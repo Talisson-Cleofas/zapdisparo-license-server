@@ -55,7 +55,9 @@ const licenseSchema = new mongoose.Schema({
   id: { type: String, required: true, unique: true, index: true, default: () => crypto.randomUUID() },
   email: { type: String, required: true, index: true, lowercase: true, trim: true },
   name: { type: String, required: true, trim: true },
-  plan: { type: String, enum: ['Demo', 'Mensal', 'Semestral', 'Anual'], default: 'Mensal', index: true },
+  // Planos novos são normalizados nas rotas de escrita. O schema permanece
+  // compatível com rótulos legados já persistidos (por exemplo, "Full Admin").
+  plan: { type: String, required: true, trim: true, default: 'Mensal', index: true },
   licenseType: { type: String, enum: ['demo', 'paid'], default: 'paid', index: true },
   // token é o nome oficial na coleção; licenseKey permanece por compatibilidade com o aplicativo atual.
   token: { type: String, required: true, unique: true, index: true, trim: true, uppercase: true },
@@ -1232,6 +1234,7 @@ app.patch('/api/admin/licenses/:id', requireAdmin, async (req, res) => {
   const allowed = ['name', 'email', 'status', 'plan', 'expiresAt', 'renewCount', 'dailyLimit', 'connectionLimit', 'allowedDevices', 'notes'];
   const update = Object.fromEntries(Object.entries(req.body || {}).filter(([key]) => allowed.includes(key)));
   if ('email' in update) { update.email = normalizeEmail(update.email); if (!validEmail(update.email)) return res.status(400).json({ ok: false, message: 'E-mail inválido.' }); }
+  if ('plan' in update) update.plan = planSettings(update.plan).name;
   if ('expiresAt' in update) update.expiresAt = update.expiresAt ? parseDate(update.expiresAt) : null;
   ['dailyLimit', 'connectionLimit', 'allowedDevices'].forEach((key) => { if (key in update) update[key] = boundedNumber(update[key], 1); });
   const license = await License.findByIdAndUpdate(req.params.id, update, { new: true, runValidators: true });
@@ -1364,10 +1367,10 @@ async function start() {
   });
   for (const legacy of legacyLicenses) {
     legacy.id = legacy.id || crypto.randomUUID();
+    legacy.name = String(legacy.name || legacy.email?.split('@')[0] || 'Cliente').trim();
     legacy.token = String(legacy.token || legacy.licenseKey || generateLicenseKey(legacy.email)).toUpperCase();
     legacy.licenseKey = legacy.token;
     legacy.renewCount = Number(legacy.renewCount || 0);
-    if (!legacy.expiresAt) legacy.expiresAt = addDaysFrom(null, 30);
     legacy.tokenSignature = signLicense(legacy);
     legacy.signatureVersion = 1;
     await legacy.save();
@@ -1380,4 +1383,6 @@ async function start() {
     scheduleDatabaseBackup();
   });
 }
-start().catch((error) => { console.error(error); process.exit(1); });
+if (require.main === module) start().catch((error) => { console.error(error); process.exit(1); });
+
+module.exports = { app, License, start };
