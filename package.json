@@ -1,16 +1,19 @@
 {
   "name": "zapdisparo-license-server",
-  "version": "1.0.0",
+  "version": "5.4.0",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "node src/server.js"
+    "dev": "node src/server.js",
+    "keys:generate": "node scripts/generate-license-keys.js",
+    "test": "node --check src/server.js && node --check scripts/generate-license-keys.js"
   },
   "dependencies": {
     "cors": "latest",
     "dotenv": "latest",
     "express": "latest",
+    "helmet": "latest",
     "mongoose": "latest",
-    "nodemailer": "^6.10.1"
+    "nodemailer": "^9.0.3"
   }
 }
