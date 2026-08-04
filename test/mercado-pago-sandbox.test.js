@@ -5,7 +5,8 @@ const {
   sandboxPixOrderPayload,
   mercadoPagoOrderPayment,
   mercadoPagoOrderStatus,
-  mercadoPagoOrderAmount
+  mercadoPagoOrderAmount,
+  selectMercadoPagoSubscriptionCredentials
 } = require('../src/server');
 
 test('monta order PIX de Sandbox sem substituir os dados comerciais do pedido', () => {
@@ -44,4 +45,36 @@ test('normaliza estados e valores retornados pela API Orders', () => {
     transactions: { payments: [{ id: 'PAY-1', amount: '99.99', status: 'approved' }] }
   };
   assert.equal(mercadoPagoOrderStatus(approvedOrder), 'approved');
+});
+
+test('isola as credenciais da assinatura no Sandbox', () => {
+  const credentials = selectMercadoPagoSubscriptionCredentials({
+    paymentEnvironment: 'sandbox',
+    purchaseEmail: 'cliente-real@example.com',
+    accessToken: 'token-pix',
+    subscriptionAccessToken: 'token-assinatura',
+    sandboxPayerEmail: 'test@testuser.com'
+  });
+
+  assert.deepEqual(credentials, {
+    accessToken: 'token-assinatura',
+    accessTokenVariable: 'MERCADO_PAGO_SUBSCRIPTION_ACCESS_TOKEN',
+    payerEmail: 'test@testuser.com'
+  });
+});
+
+test('mantem a credencial principal e o e-mail real em producao', () => {
+  const credentials = selectMercadoPagoSubscriptionCredentials({
+    paymentEnvironment: 'production',
+    purchaseEmail: 'cliente-real@example.com',
+    accessToken: 'token-producao',
+    subscriptionAccessToken: 'token-sandbox',
+    sandboxPayerEmail: 'test@testuser.com'
+  });
+
+  assert.deepEqual(credentials, {
+    accessToken: 'token-producao',
+    accessTokenVariable: 'MERCADO_PAGO_ACCESS_TOKEN',
+    payerEmail: 'cliente-real@example.com'
+  });
 });
