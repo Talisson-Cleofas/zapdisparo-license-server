@@ -1,0 +1,14 @@
+<svg width="1280" height="360" viewBox="0 0 1280 360" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1280" height="360" rx="56" fill="#070B12"/>
+  <rect x="48" y="48" width="264" height="264" rx="72" fill="#0B1628" stroke="#2F7DFF" stroke-width="12"/>
+  <path d="M196 74L104 198H169L154 292L254 162H187L196 74Z" fill="url(#bolt)"/>
+  <text x="352" y="168" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="76" font-weight="800" fill="#F7FAFF">ZapDisparo</text>
+  <text x="358" y="226" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="30" font-weight="600" letter-spacing="7" fill="#8EA6C8">MULTI-CONEXÃO</text>
+  <defs>
+    <linearGradient id="bolt" x1="110" y1="74" x2="260" y2="292" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8FD0FF"/>
+      <stop offset="0.45" stop-color="#4F8DF7"/>
+      <stop offset="1" stop-color="#0B63FF"/>
+    </linearGradient>
+  </defs>
+</svg>

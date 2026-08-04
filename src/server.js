@@ -38,11 +38,14 @@ const BACKUP_HOUR = Math.min(23, Math.max(0, Number(process.env.BACKUP_HOUR || 2
 const BACKUP_MINUTE = Math.min(59, Math.max(0, Number(process.env.BACKUP_MINUTE || 0)));
 const BACKUP_RETENTION_DAYS = Math.max(1, Number(process.env.BACKUP_RETENTION_DAYS || 7));
 const BACKUP_DIR = process.env.BACKUP_DIR || path.join(process.cwd(), 'backups');
+const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 
 app.set('trust proxy', 1);
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(cors({ origin: SALES_ORIGIN === '*' ? true : SALES_ORIGIN.split(',').map((item) => item.trim()) }));
 app.use(express.json({ limit: '2mb' }));
+app.use(express.static(PUBLIC_DIR, { index: false, maxAge: '1h' }));
+app.get('/', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'sales.html')));
 
 const deviceSchema = new mongoose.Schema({
   deviceId: String,
