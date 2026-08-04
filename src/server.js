@@ -16,6 +16,7 @@ const zlib = require('zlib');
 const app = express();
 const PORT = Number(process.env.PORT || 4000);
 const MONGODB_URI = process.env.MONGODB_URI;
+const MONGODB_DB_NAME = String(process.env.MONGODB_DB_NAME || '').trim();
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
 const DOWNLOAD_URL = process.env.DOWNLOAD_URL || 'https://seusite.com/download/ZapDisparo-Setup.exe';
 const DEMO_DOWNLOAD_URL = process.env.DEMO_DOWNLOAD_URL || DOWNLOAD_URL;
@@ -27,6 +28,9 @@ const MERCADO_PAGO_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN || '';
 const MERCADO_PAGO_WEBHOOK_SECRET = process.env.MERCADO_PAGO_WEBHOOK_SECRET || '';
 const MERCADO_PAGO_WEBHOOK_URL = process.env.MERCADO_PAGO_WEBHOOK_URL || 'https://zapdisparo-license-server.onrender.com/api/payments/mercadopago/webhook';
 const MERCADO_PAGO_SUBSCRIPTION_BACK_URL = process.env.MERCADO_PAGO_SUBSCRIPTION_BACK_URL || 'https://seusite.com/sales.html';
+const PAYMENT_ENVIRONMENT = String(process.env.PAYMENT_ENVIRONMENT || 'production').trim().toLowerCase() === 'sandbox' ? 'sandbox' : 'production';
+const MERCADO_PAGO_SANDBOX_PAYER_EMAIL = process.env.MERCADO_PAGO_SANDBOX_PAYER_EMAIL || 'test_user_br@testuser.com';
+const MERCADO_PAGO_SANDBOX_APPROVAL_NAME = process.env.MERCADO_PAGO_SANDBOX_APPROVAL_NAME || 'APRO';
 const LICENSE_REMINDER_HOUR = Math.min(23, Math.max(0, Number(process.env.LICENSE_REMINDER_HOUR || 8)));
 const LICENSE_REMINDER_MINUTE = Math.min(59, Math.max(0, Number(process.env.LICENSE_REMINDER_MINUTE || 0)));
 const LICENSE_SIGNING_SECRET = process.env.LICENSE_SIGNING_SECRET || '';
@@ -98,6 +102,7 @@ const purchaseSchema = new mongoose.Schema({
   amount: { type: Number, default: 97 },
   paymentMethod: { type: String, default: 'pix' },
   paymentReference: String,
+  mercadoPagoOrderId: { type: String, index: true },
   mercadoPagoPaymentId: { type: String, index: true },
   mercadoPagoStatus: String,
   mercadoPagoStatusDetail: String,
@@ -556,6 +561,7 @@ function publicOrder(purchase) {
     plan: purchase.plan,
     amount: purchase.amount,
     paymentMethod: purchase.paymentMethod,
+    paymentEnvironment: PAYMENT_ENVIRONMENT,
     paymentStatus: purchase.mercadoPagoStatus || purchase.status,
     paymentStatusDetail: purchase.mercadoPagoStatusDetail || '',
     qrCode: purchase.status === 'pending' ? purchase.mercadoPagoQrCode : undefined,
@@ -591,7 +597,71 @@ async function mercadoPagoRequest(path, options = {}) {
   }
   return data;
 }
+
+function sandboxPixOrderPayload(purchase) {
+  const amount = Number(purchase.amount).toFixed(2);
+  return {
+    type: 'online',
+    processing_mode: 'automatic',
+    external_reference: purchase.orderCode,
+    total_amount: amount,
+    payer: {
+      email: MERCADO_PAGO_SANDBOX_PAYER_EMAIL,
+      first_name: MERCADO_PAGO_SANDBOX_APPROVAL_NAME
+    },
+    transactions: {
+      payments: [{
+        amount,
+        payment_method: { id: 'pix', type: 'bank_transfer' }
+      }]
+    }
+  };
+}
+
+function mercadoPagoOrderPayment(order) {
+  const payments = order?.transactions?.payments;
+  return Array.isArray(payments) ? (payments[0] || {}) : (payments || {});
+}
+
+function mercadoPagoOrderStatus(order) {
+  const payment = mercadoPagoOrderPayment(order);
+  if (payment.status === 'approved' || order?.status === 'processed') return 'approved';
+  return String(payment.status || order?.status || 'pending');
+}
+
+function mercadoPagoOrderAmount(order) {
+  const payment = mercadoPagoOrderPayment(order);
+  return Number(payment.amount ?? order?.total_amount ?? 0);
+}
+
+function applyMercadoPagoOrder(purchase, order) {
+  const payment = mercadoPagoOrderPayment(order);
+  const paymentMethod = payment.payment_method || {};
+  purchase.mercadoPagoOrderId = String(order.id || '');
+  purchase.mercadoPagoPaymentId = String(payment.id || '');
+  purchase.paymentReference = purchase.mercadoPagoOrderId;
+  purchase.mercadoPagoStatus = mercadoPagoOrderStatus(order);
+  purchase.mercadoPagoStatusDetail = String(payment.status_detail || order.status_detail || '');
+  purchase.mercadoPagoQrCode = String(paymentMethod.qr_code || '');
+  purchase.mercadoPagoQrCodeBase64 = String(paymentMethod.qr_code_base64 || '');
+  purchase.mercadoPagoTicketUrl = String(paymentMethod.ticket_url || '');
+  purchase.paymentLastCheckedAt = new Date();
+  return payment;
+}
+
+async function createMercadoPagoSandboxPix(purchase) {
+  const order = await mercadoPagoRequest('/v1/orders', {
+    method: 'POST',
+    headers: { 'X-Idempotency-Key': `zap-sandbox-${purchase.orderCode}` },
+    body: JSON.stringify(sandboxPixOrderPayload(purchase))
+  });
+  applyMercadoPagoOrder(purchase, order);
+  await purchase.save();
+  return order;
+}
+
 async function createMercadoPagoPix(purchase) {
+  if (PAYMENT_ENVIRONMENT === 'sandbox') return createMercadoPagoSandboxPix(purchase);
   const [firstName, ...rest] = String(purchase.name || 'Cliente').trim().split(/\s+/);
   const document = String(purchase.cpfCnpj || '').replace(/\D/g, '');
   const payload = {
@@ -778,7 +848,29 @@ async function finalizePurchase(purchase, source = 'automatic', providerPaymentI
     throw error;
   }
 }
+
+async function syncMercadoPagoOrder(purchase) {
+  if (!purchase.mercadoPagoOrderId || purchase.status === 'paid') return purchase;
+  const order = await mercadoPagoRequest(`/v1/orders/${encodeURIComponent(purchase.mercadoPagoOrderId)}`);
+  const externalReference = String(order.external_reference || '');
+  if (externalReference !== purchase.orderCode) throw new Error('Referência externa da order não confere.');
+  if (Math.abs(mercadoPagoOrderAmount(order) - Number(purchase.amount)) > 0.009) throw new Error('Valor da order não confere.');
+
+  const payment = applyMercadoPagoOrder(purchase, order);
+  if (purchase.mercadoPagoStatus === 'approved') {
+    await finalizePurchase(purchase, 'mercado-pago-sandbox', String(payment.id || order.id));
+  } else if (['cancelled', 'canceled', 'rejected', 'refunded', 'charged_back', 'expired'].includes(purchase.mercadoPagoStatus)) {
+    purchase.mercadoPagoQrCode = '';
+    purchase.mercadoPagoQrCodeBase64 = '';
+    await purchase.save();
+  } else {
+    await purchase.save();
+  }
+  return purchase;
+}
+
 async function syncMercadoPagoPayment(purchase) {
+  if (purchase.mercadoPagoOrderId) return syncMercadoPagoOrder(purchase);
   if (!purchase.mercadoPagoPaymentId || purchase.status === 'paid') return purchase;
   const payment = await mercadoPagoRequest(`/v1/payments/${encodeURIComponent(purchase.mercadoPagoPaymentId)}`);
   purchase.mercadoPagoStatus = payment.status;
@@ -799,7 +891,28 @@ async function syncMercadoPagoPayment(purchase) {
   return purchase;
 }
 
-app.get('/health', (req, res) => res.json({ ok: true, service: 'zapdisparo-license-server' }));
+async function processMercadoPagoOrderWebhook(orderId) {
+  const order = await mercadoPagoRequest(`/v1/orders/${encodeURIComponent(orderId)}`);
+  const externalReference = String(order.external_reference || '');
+  const purchase = await Purchase.findOne({
+    $or: [
+      { mercadoPagoOrderId: String(order.id || orderId) },
+      { orderCode: externalReference }
+    ]
+  });
+  if (!purchase) return;
+  if (externalReference !== purchase.orderCode) throw new Error('Referência externa da order inválida.');
+  if (Math.abs(mercadoPagoOrderAmount(order) - Number(purchase.amount)) > 0.009) throw new Error('Valor recebido na order difere do pedido.');
+
+  const payment = applyMercadoPagoOrder(purchase, order);
+  if (purchase.mercadoPagoStatus === 'approved') {
+    await finalizePurchase(purchase, 'webhook-mercado-pago-sandbox', String(payment.id || order.id));
+  } else {
+    await purchase.save();
+  }
+}
+
+app.get('/health', (req, res) => res.json({ ok: true, service: 'zapdisparo-license-server', paymentEnvironment: PAYMENT_ENVIRONMENT }));
 
 app.post('/api/sales/orders', publicRateLimit, async (req, res) => {
   const body = req.body || {};
@@ -840,7 +953,7 @@ app.get('/api/sales/orders/:orderCode', publicRateLimit, async (req, res) => {
   if (!requireOrderAccess(purchase, req, res)) return;
   try {
     const lastCheck = purchase.paymentLastCheckedAt ? purchase.paymentLastCheckedAt.getTime() : 0;
-    if (purchase.status === 'pending' && purchase.mercadoPagoPaymentId && Date.now() - lastCheck > 5000) await syncMercadoPagoPayment(purchase);
+    if (purchase.status === 'pending' && (purchase.mercadoPagoPaymentId || purchase.mercadoPagoOrderId) && Date.now() - lastCheck > 5000) await syncMercadoPagoPayment(purchase);
   } catch (error) { console.error('Falha ao consultar pagamento:', error.message); }
   res.json({ ok: true, order: publicOrder(purchase) });
 });
@@ -856,14 +969,18 @@ app.post('/api/payments/mercadopago/subscription/create', publicRateLimit, async
 app.post('/api/payments/mercadopago/webhook', async (req, res) => {
   try {
     const dataId = String(req.query['data.id'] || req.body?.data?.id || '');
-    const type = String(req.query.type || req.body?.type || '');
+    const type = String(req.query.type || req.body?.type || '').toLowerCase();
     if (MERCADO_PAGO_WEBHOOK_SECRET) {
       if (!validateMercadoPagoSignature(req, dataId)) throw new Error('Assinatura inválida.');
     }
     res.status(200).json({ ok: true });
-    if (type && type !== 'payment') return;
+    if (type && !['payment', 'order', 'orders'].includes(type)) return;
     setImmediate(async () => {
       try {
+        if (['order', 'orders'].includes(type)) {
+          await processMercadoPagoOrderWebhook(dataId);
+          return;
+        }
         const payment = await mercadoPagoRequest(`/v1/payments/${encodeURIComponent(dataId)}`);
         const subscriptionId = String(payment.subscription_id || payment.preapproval_id || payment.metadata?.subscription_id || '');
         let purchase = await Purchase.findOne({ $or: [{ mercadoPagoPaymentId: String(payment.id) }, { orderCode: String(payment.external_reference || '') }, ...(subscriptionId ? [{ mercadoPagoSubscriptionId: subscriptionId }] : [])] });
@@ -1358,7 +1475,7 @@ app.use((error, req, res, next) => {
 async function start() {
   if (!MONGODB_URI) throw new Error('Configure MONGODB_URI no .env');
   assertSecurityConfiguration();
-  await mongoose.connect(MONGODB_URI);
+  await mongoose.connect(MONGODB_URI, MONGODB_DB_NAME ? { dbName: MONGODB_DB_NAME } : undefined);
 
   // Migração segura para licenças criadas nas versões anteriores à 5.0.4.
   const legacyLicenses = await License.find({
@@ -1388,4 +1505,12 @@ async function start() {
 }
 if (require.main === module) start().catch((error) => { console.error(error); process.exit(1); });
 
-module.exports = { app, License, start };
+module.exports = {
+  app,
+  License,
+  start,
+  sandboxPixOrderPayload,
+  mercadoPagoOrderPayment,
+  mercadoPagoOrderStatus,
+  mercadoPagoOrderAmount
+};
