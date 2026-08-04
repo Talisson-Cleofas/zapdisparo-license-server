@@ -19,20 +19,44 @@ npm run dev
 - Variáveis: `MONGODB_URI` e `ADMIN_KEY`
 - Página pública de vendas: `/sales.html` (a raiz `/` direciona para a mesma página)
 
-## Sandbox do Mercado Pago
+## Checkout Pro do Mercado Pago
+
+A página pública usa o Checkout Pro hospedado. O cliente escolhe PIX, cartão ou boleto no ambiente do Mercado Pago, e o ZapDisparo não recebe dados de cartão. Cada pagamento aprovado concede ou renova a licença pelo período do plano comprado:
+
+- Mensal: R$ 99,99 por 30 dias
+- Semestral: R$ 599,99 por 180 dias
+- Anual: R$ 1.199,99 por 365 dias
+
+O servidor envia `external_reference` com o código exclusivo do pedido, valida a assinatura do webhook, consulta o pagamento diretamente na API do Mercado Pago, confere referência e valor e só então libera a licença. A operação é idempotente: o mesmo pagamento não renova a licença duas vezes.
+
+Configure em produção:
+
+- `MERCADO_PAGO_CHECKOUT_ACCESS_TOKEN`
+- `MERCADO_PAGO_CHECKOUT_WEBHOOK_SECRET`
+- `MERCADO_PAGO_CHECKOUT_WEBHOOK_URL=https://seu-dominio/api/payments/mercadopago/checkout/webhook`
+- `MERCADO_PAGO_CHECKOUT_BACK_URL=https://seu-dominio/sales.html`
+- `PAYMENT_TEST_MODE=` vazio
+- `CHECKOUT_TEST_AMOUNT_CENTS=0`
+
+## Homologação com compra real de R$ 1,00
 
 Use uma segunda instância do serviço para não interromper pagamentos reais. Nela, configure:
 
 - `PAYMENT_ENVIRONMENT=sandbox`
 - `MONGODB_DB_NAME=zapdisparo_sandbox`
-- `MERCADO_PAGO_ACCESS_TOKEN` com o Access Token de teste usado pelo PIX/Orders
-- `MERCADO_PAGO_SUBSCRIPTION_ACCESS_TOKEN` com a credencial de produção da aplicação criada dentro da conta vendedora de teste
-- `MERCADO_PAGO_WEBHOOK_SECRET` com a assinatura secreta do webhook do PIX/Orders
-- `MERCADO_PAGO_SUBSCRIPTION_WEBHOOK_SECRET` com a assinatura secreta do webhook da aplicação vendedora de teste
-- `MERCADO_PAGO_WEBHOOK_URL` apontando para `/api/payments/mercadopago/webhook` da instância Sandbox
+- `PAYMENT_TEST_MODE=controlled-real`
+- `CHECKOUT_TEST_AMOUNT_CENTS=100`
+- `MERCADO_PAGO_CHECKOUT_ACCESS_TOKEN` com o Access Token de produção da conta vendedora real usada na homologação
+- `MERCADO_PAGO_CHECKOUT_WEBHOOK_SECRET` com a assinatura secreta do webhook dessa aplicação
+- `MERCADO_PAGO_CHECKOUT_WEBHOOK_URL` apontando para `/api/payments/mercadopago/checkout/webhook` da instância Sandbox
+- `MERCADO_PAGO_CHECKOUT_BACK_URL` apontando para `/sales.html` da instância Sandbox
 - `SALES_ORIGIN` com o domínio da instância Sandbox
 
-No modo Sandbox, o PIX usa a API Orders oficial de testes e preserva o e-mail informado na compra para validar o envio da licença. O pagador enviado ao Mercado Pago permanece fictício. A assinatura recorrente usa uma credencial separada porque o teste de `/preapproval` exige uma aplicação pertencente ao vendedor de teste. Essa separação não altera o fluxo de produção.
+As travas impedem a inicialização se o valor não for exatamente 100 centavos, se `PAYMENT_ENVIRONMENT` não for `sandbox` ou se a URL de retorno não contiver `sandbox` ou `homologacao`. Os preços oficiais permanecem inalterados.
+
+Depois do pagamento real, confirme no Sandbox: pedido `paid`, licença criada/renovada uma única vez, e-mail enviado e registro do evento. Não faça a compra usando a mesma conta Mercado Pago que recebe o pagamento.
+
+Os endpoints antigos de PIX e assinatura foram preservados para compatibilidade, mas a página de vendas não os oferece mais.
 
 ## Criar licença
 
