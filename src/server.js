@@ -25,12 +25,18 @@ const EMAIL_LOGO_URL = process.env.EMAIL_LOGO_URL || '';
 const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || process.env.SMTP_USER || '';
 const SALES_ORIGIN = process.env.SALES_ORIGIN || '*';
 const MERCADO_PAGO_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN || '';
+const MERCADO_PAGO_CHECKOUT_ACCESS_TOKEN = process.env.MERCADO_PAGO_CHECKOUT_ACCESS_TOKEN || '';
 const MERCADO_PAGO_SUBSCRIPTION_ACCESS_TOKEN = process.env.MERCADO_PAGO_SUBSCRIPTION_ACCESS_TOKEN || '';
 const MERCADO_PAGO_WEBHOOK_SECRET = process.env.MERCADO_PAGO_WEBHOOK_SECRET || '';
+const MERCADO_PAGO_CHECKOUT_WEBHOOK_SECRET = process.env.MERCADO_PAGO_CHECKOUT_WEBHOOK_SECRET || '';
 const MERCADO_PAGO_SUBSCRIPTION_WEBHOOK_SECRET = process.env.MERCADO_PAGO_SUBSCRIPTION_WEBHOOK_SECRET || '';
 const MERCADO_PAGO_WEBHOOK_URL = process.env.MERCADO_PAGO_WEBHOOK_URL || 'https://zapdisparo-license-server.onrender.com/api/payments/mercadopago/webhook';
+const MERCADO_PAGO_CHECKOUT_WEBHOOK_URL = process.env.MERCADO_PAGO_CHECKOUT_WEBHOOK_URL || MERCADO_PAGO_WEBHOOK_URL.replace(/\/webhook\/?$/, '/checkout/webhook');
+const MERCADO_PAGO_CHECKOUT_BACK_URL = process.env.MERCADO_PAGO_CHECKOUT_BACK_URL || process.env.MERCADO_PAGO_SUBSCRIPTION_BACK_URL || 'https://seusite.com/sales.html';
 const MERCADO_PAGO_SUBSCRIPTION_BACK_URL = process.env.MERCADO_PAGO_SUBSCRIPTION_BACK_URL || 'https://seusite.com/sales.html';
 const PAYMENT_ENVIRONMENT = String(process.env.PAYMENT_ENVIRONMENT || 'production').trim().toLowerCase() === 'sandbox' ? 'sandbox' : 'production';
+const PAYMENT_TEST_MODE = String(process.env.PAYMENT_TEST_MODE || '').trim().toLowerCase();
+const CHECKOUT_TEST_AMOUNT_CENTS = Number(process.env.CHECKOUT_TEST_AMOUNT_CENTS || 0);
 const MERCADO_PAGO_SANDBOX_PAYER_EMAIL = process.env.MERCADO_PAGO_SANDBOX_PAYER_EMAIL || 'test_user_br@testuser.com';
 const MERCADO_PAGO_SANDBOX_APPROVAL_NAME = process.env.MERCADO_PAGO_SANDBOX_APPROVAL_NAME || 'APRO';
 const MERCADO_PAGO_SANDBOX_SUBSCRIPTION_PAYER_EMAIL = process.env.MERCADO_PAGO_SANDBOX_SUBSCRIPTION_PAYER_EMAIL || 'test@testuser.com';
@@ -115,6 +121,7 @@ const purchaseSchema = new mongoose.Schema({
   mercadoPagoExpiresAt: Date,
   mercadoPagoSubscriptionId: { type: String, index: true },
   mercadoPagoSubscriptionStatus: String,
+  mercadoPagoPreferenceId: { type: String, index: true },
   checkoutUrl: String,
   paymentApprovedAt: Date,
   paymentLastCheckedAt: Date,
@@ -175,6 +182,8 @@ const paymentEventSchema = new mongoose.Schema({
   amount: Number,
   status: String,
   processedAt: Date,
+  processingStartedAt: Date,
+  processingToken: String,
   licenseId: { type: mongoose.Schema.Types.ObjectId, ref: 'License' },
   action: { type: String, enum: ['created', 'renewed', 'ignored'], default: 'ignored' },
   error: String
@@ -239,6 +248,7 @@ function generateLicenseKey(email = '') {
 function generateOrderCode() { return `PED-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`; }
 
 function assertSecurityConfiguration() {
+  validatePaymentTestConfiguration();
   if (!LICENSE_SIGNING_SECRET || LICENSE_SIGNING_SECRET.length < 32) {
     throw new Error('Configure LICENSE_SIGNING_SECRET com pelo menos 32 caracteres.');
   }
@@ -247,6 +257,31 @@ function assertSecurityConfiguration() {
   if (!MERCADO_PAGO_WEBHOOK_SECRET) throw new Error('Configure MERCADO_PAGO_WEBHOOK_SECRET antes de iniciar em produção.');
   if (ADMIN_KEY.length < 24) throw new Error('Configure uma ADMIN_KEY forte com pelo menos 24 caracteres.');
   if (SALES_ORIGIN === '*') throw new Error('Configure SALES_ORIGIN com os domínios autorizados; o curinga * não é aceito em produção.');
+}
+
+function validatePaymentTestConfiguration({
+  paymentTestMode = PAYMENT_TEST_MODE,
+  checkoutTestAmountCents = CHECKOUT_TEST_AMOUNT_CENTS,
+  paymentEnvironment = PAYMENT_ENVIRONMENT,
+  checkoutBackUrl = MERCADO_PAGO_CHECKOUT_BACK_URL
+} = {}) {
+  if (paymentTestMode && paymentTestMode !== 'controlled-real') {
+    throw new Error('PAYMENT_TEST_MODE inválido.');
+  }
+  if (paymentTestMode === 'controlled-real') {
+    if (checkoutTestAmountCents !== 100) throw new Error('O teste real controlado deve cobrar exatamente 100 centavos.');
+    if (paymentEnvironment !== 'sandbox') throw new Error('O teste real controlado só pode ser ativado no ambiente Sandbox.');
+    let hostname = '';
+    try { hostname = new URL(checkoutBackUrl).hostname; } catch { throw new Error('MERCADO_PAGO_CHECKOUT_BACK_URL inválida.'); }
+    if (!/(sandbox|homologacao)/i.test(hostname)) throw new Error('O teste real controlado exige uma URL de retorno de Sandbox ou homologação.');
+  } else if (checkoutTestAmountCents !== 0) {
+    throw new Error('CHECKOUT_TEST_AMOUNT_CENTS exige PAYMENT_TEST_MODE=controlled-real.');
+  }
+  return { controlledPaymentTest: paymentTestMode === 'controlled-real', checkoutTestAmountCents };
+}
+
+function isControlledPaymentTest() {
+  return PAYMENT_TEST_MODE === 'controlled-real';
 }
 
 function signLicense(license) {
@@ -606,6 +641,7 @@ function publicOrder(purchase) {
     amount: purchase.amount,
     paymentMethod: purchase.paymentMethod,
     paymentEnvironment: PAYMENT_ENVIRONMENT,
+    controlledPaymentTest: isControlledPaymentTest(),
     paymentStatus: purchase.mercadoPagoStatus || purchase.status,
     paymentStatusDetail: purchase.mercadoPagoStatusDetail || '',
     qrCode: purchase.status === 'pending' ? purchase.mercadoPagoQrCode : undefined,
@@ -619,9 +655,72 @@ function publicOrder(purchase) {
     licenseKey: purchase.status === 'paid' ? purchase.licenseKey : undefined,
     email: purchase.status === 'paid' ? purchase.email : undefined,
     checkoutUrl: purchase.checkoutUrl || undefined,
+    preferenceId: purchase.mercadoPagoPreferenceId || undefined,
     subscriptionId: purchase.mercadoPagoSubscriptionId || undefined
   };
 }
+
+function checkoutAmountForPlan(plan, {
+  paymentTestMode = PAYMENT_TEST_MODE,
+  checkoutTestAmountCents = CHECKOUT_TEST_AMOUNT_CENTS
+} = {}) {
+  const settings = planSettings(plan);
+  return paymentTestMode === 'controlled-real' ? checkoutTestAmountCents / 100 : settings.amount;
+}
+
+function mercadoPagoCheckoutCredentials({
+  paymentTestMode = PAYMENT_TEST_MODE,
+  checkoutAccessToken = MERCADO_PAGO_CHECKOUT_ACCESS_TOKEN,
+  accessToken = MERCADO_PAGO_ACCESS_TOKEN,
+  checkoutWebhookSecret = MERCADO_PAGO_CHECKOUT_WEBHOOK_SECRET,
+  webhookSecret = MERCADO_PAGO_WEBHOOK_SECRET
+} = {}) {
+  const dedicatedTokenRequired = paymentTestMode === 'controlled-real';
+  return {
+    accessToken: dedicatedTokenRequired ? checkoutAccessToken : (checkoutAccessToken || accessToken),
+    accessTokenVariable: (dedicatedTokenRequired || checkoutAccessToken) ? 'MERCADO_PAGO_CHECKOUT_ACCESS_TOKEN' : 'MERCADO_PAGO_ACCESS_TOKEN',
+    webhookSecret: checkoutWebhookSecret || webhookSecret,
+    webhookSecretVariable: checkoutWebhookSecret ? 'MERCADO_PAGO_CHECKOUT_WEBHOOK_SECRET' : 'MERCADO_PAGO_WEBHOOK_SECRET'
+  };
+}
+
+function checkoutBackUrls(backUrl = MERCADO_PAGO_CHECKOUT_BACK_URL) {
+  const create = (status) => {
+    const url = new URL(backUrl);
+    url.searchParams.set('payment', status);
+    return url.toString();
+  };
+  return { success: create('success'), pending: create('pending'), failure: create('failure') };
+}
+
+function mercadoPagoCheckoutPayload(purchase, {
+  controlledPaymentTest = isControlledPaymentTest(),
+  webhookUrl = MERCADO_PAGO_CHECKOUT_WEBHOOK_URL,
+  backUrl = MERCADO_PAGO_CHECKOUT_BACK_URL,
+  sandboxCheckout = PAYMENT_ENVIRONMENT === 'sandbox' && !isControlledPaymentTest()
+} = {}) {
+  const title = controlledPaymentTest
+    ? `TESTE CONTROLADO — ZapDisparo — ${purchase.plan}`
+    : `Licença ZapDisparo — ${purchase.plan}`;
+  const payload = {
+    items: [{
+      id: String(purchase.plan || 'Mensal').toLowerCase(),
+      title,
+      quantity: 1,
+      currency_id: 'BRL',
+      unit_price: Number(purchase.amount)
+    }],
+    external_reference: purchase.orderCode,
+    notification_url: webhookUrl,
+    back_urls: checkoutBackUrls(backUrl),
+    auto_return: 'approved',
+    statement_descriptor: 'ZAPDISPARO',
+    metadata: { order_code: purchase.orderCode }
+  };
+  if (!sandboxCheckout) payload.payer = { email: purchase.email, name: purchase.name };
+  return payload;
+}
+
 async function mercadoPagoRequest(path, options = {}, accessToken = MERCADO_PAGO_ACCESS_TOKEN, accessTokenVariable = 'MERCADO_PAGO_ACCESS_TOKEN') {
   if (!accessToken) throw new Error(`${accessTokenVariable} não configurado.`);
   const response = await fetch(`https://api.mercadopago.com${path}`, {
@@ -640,6 +739,30 @@ async function mercadoPagoRequest(path, options = {}, accessToken = MERCADO_PAGO
     throw error;
   }
   return data;
+}
+
+async function createMercadoPagoCheckout(purchase) {
+  const credentials = mercadoPagoCheckoutCredentials();
+  const sandboxCheckout = PAYMENT_ENVIRONMENT === 'sandbox' && !isControlledPaymentTest();
+  const preference = await mercadoPagoRequest('/checkout/preferences', {
+    method: 'POST',
+    headers: { 'X-Idempotency-Key': `zap-checkout-${purchase.orderCode}` },
+    body: JSON.stringify(mercadoPagoCheckoutPayload(purchase, { sandboxCheckout }))
+  }, credentials.accessToken, credentials.accessTokenVariable);
+  const checkoutUrl = sandboxCheckout ? preference.sandbox_init_point : preference.init_point;
+  if (!checkoutUrl) {
+    const error = new Error('O Mercado Pago não retornou a URL do checkout.');
+    error.status = 502;
+    throw error;
+  }
+  purchase.paymentMethod = 'mercado_pago_checkout';
+  purchase.mercadoPagoPreferenceId = String(preference.id || '');
+  purchase.checkoutUrl = String(checkoutUrl);
+  purchase.paymentReference = purchase.mercadoPagoPreferenceId;
+  purchase.mercadoPagoStatus = 'pending';
+  purchase.paymentLastCheckedAt = new Date();
+  await purchase.save();
+  return preference;
 }
 
 function sandboxPixOrderPayload(purchase) {
@@ -773,16 +896,40 @@ async function createMercadoPagoSubscription(purchase) {
 async function finalizePurchase(purchase, source = 'automatic', providerPaymentId = '') {
   const paymentId = String(providerPaymentId || purchase.mercadoPagoPaymentId || '').trim();
   let event = null;
+  const processingToken = crypto.randomUUID();
 
   if (paymentId) {
-    event = await PaymentEvent.findOneAndUpdate(
-      { providerPaymentId: paymentId },
-      { $setOnInsert: { providerPaymentId: paymentId, orderCode: purchase.orderCode, subscriptionId: purchase.mercadoPagoSubscriptionId, email: purchase.email, amount: purchase.amount, status: 'approved' } },
-      { new: true, upsert: true }
-    );
-    if (event.processedAt) {
-      const knownLicense = event.licenseId ? await License.findById(event.licenseId) : null;
-      return { purchase, license: knownLicense, alreadyProcessed: true, action: event.action };
+    const staleLock = new Date(Date.now() - 5 * 60 * 1000);
+    try {
+      event = await PaymentEvent.findOneAndUpdate(
+        {
+          providerPaymentId: paymentId,
+          processedAt: null,
+          $or: [{ processingStartedAt: null }, { processingStartedAt: { $lt: staleLock } }]
+        },
+        {
+          $setOnInsert: { providerPaymentId: paymentId, orderCode: purchase.orderCode, subscriptionId: purchase.mercadoPagoSubscriptionId, email: purchase.email, amount: purchase.amount, status: 'approved' },
+          $set: { processingStartedAt: new Date(), processingToken }
+        },
+        { new: true, upsert: true }
+      );
+    } catch (error) {
+      if (error?.code !== 11000) throw error;
+      event = await PaymentEvent.findOne({ providerPaymentId: paymentId });
+    }
+    if (!event || event.processedAt || event.processingToken !== processingToken) {
+      const knownLicense = event?.licenseId ? await License.findById(event.licenseId) : null;
+      return { purchase, license: knownLicense, alreadyProcessed: true, processing: !event?.processedAt, action: event?.action };
+    }
+    if (purchase.status === 'paid' && purchase.licenseId) {
+      event.processedAt = new Date();
+      event.processingStartedAt = null;
+      event.processingToken = '';
+      event.licenseId = purchase.licenseId;
+      event.action = 'ignored';
+      event.error = '';
+      await event.save();
+      return { purchase, license: await License.findById(purchase.licenseId), alreadyProcessed: true, action: 'ignored' };
     }
   }
 
@@ -870,6 +1017,8 @@ async function finalizePurchase(purchase, source = 'automatic', providerPaymentI
 
     if (event) {
       event.processedAt = new Date();
+      event.processingStartedAt = null;
+      event.processingToken = '';
       event.licenseId = license._id;
       event.action = action;
       event.error = '';
@@ -886,8 +1035,10 @@ async function finalizePurchase(purchase, source = 'automatic', providerPaymentI
 
     return { purchase, license, alreadyProcessed: false, action, history };
   } catch (error) {
-    if (event) {
+    if (event && event.processingToken === processingToken) {
       event.error = error.message;
+      event.processingStartedAt = null;
+      event.processingToken = '';
       await event.save().catch(() => {});
     }
     throw error;
@@ -915,6 +1066,7 @@ async function syncMercadoPagoOrder(purchase) {
 }
 
 async function syncMercadoPagoPayment(purchase) {
+  if (purchase.paymentMethod === 'mercado_pago_checkout') return syncMercadoPagoCheckout(purchase);
   if (purchase.mercadoPagoOrderId) return syncMercadoPagoOrder(purchase);
   if (!purchase.mercadoPagoPaymentId || purchase.status === 'paid') return purchase;
   const payment = await mercadoPagoRequest(`/v1/payments/${encodeURIComponent(purchase.mercadoPagoPaymentId)}`);
@@ -933,6 +1085,95 @@ async function syncMercadoPagoPayment(purchase) {
   } else {
     await purchase.save();
   }
+  return purchase;
+}
+
+async function processMercadoPagoCheckoutPayment(paymentId, source = 'mercado-pago-checkout') {
+  const credentials = mercadoPagoCheckoutCredentials();
+  const payment = await mercadoPagoRequest(
+    `/v1/payments/${encodeURIComponent(paymentId)}`,
+    {},
+    credentials.accessToken,
+    credentials.accessTokenVariable
+  );
+  const externalReference = String(payment.external_reference || '');
+  if (!externalReference) throw new Error('Pagamento do Checkout Pro sem referência externa.');
+  const purchase = await Purchase.findOne({
+    $or: [
+      { mercadoPagoPaymentId: String(payment.id || paymentId) },
+      { orderCode: externalReference }
+    ]
+  });
+  if (!purchase) return null;
+  if (purchase.paymentMethod !== 'mercado_pago_checkout') throw new Error('Pedido não pertence ao Checkout Pro.');
+  if (externalReference !== purchase.orderCode) throw new Error('Referência externa do Checkout Pro não confere.');
+  if (Math.abs(Number(payment.transaction_amount) - Number(purchase.amount)) > 0.009) throw new Error('Valor do Checkout Pro não confere.');
+
+  purchase.mercadoPagoPaymentId = String(payment.id || paymentId);
+  purchase.paymentReference = purchase.mercadoPagoPaymentId;
+  purchase.mercadoPagoStatus = String(payment.status || 'pending');
+  purchase.mercadoPagoStatusDetail = String(payment.status_detail || '');
+  purchase.paymentLastCheckedAt = new Date();
+  if (payment.status === 'approved') {
+    await finalizePurchase(purchase, source, purchase.mercadoPagoPaymentId);
+  } else {
+    if (['cancelled', 'canceled', 'rejected', 'refunded', 'charged_back'].includes(payment.status)) purchase.status = 'cancelled';
+    await purchase.save();
+  }
+  return purchase;
+}
+
+async function applyMercadoPagoMerchantOrder(order, source = 'mercado-pago-checkout-merchant-order') {
+  const externalReference = String(order.external_reference || '');
+  if (!externalReference) return null;
+  const purchase = await Purchase.findOne({ orderCode: externalReference });
+  if (!purchase) return null;
+  if (purchase.paymentMethod !== 'mercado_pago_checkout') throw new Error('Pedido não pertence ao Checkout Pro.');
+  if (externalReference !== purchase.orderCode) throw new Error('Referência externa da merchant order não confere.');
+  const totalAmount = Number(order.total_amount);
+  if (Number.isFinite(totalAmount) && Math.abs(totalAmount - Number(purchase.amount)) > 0.009) {
+    throw new Error('Valor da merchant order não confere.');
+  }
+  const approvedPayment = Array.isArray(order.payments)
+    ? order.payments.find((payment) => payment.status === 'approved' && payment.id)
+    : null;
+  if (approvedPayment) return processMercadoPagoCheckoutPayment(String(approvedPayment.id), source);
+  purchase.mercadoPagoStatus = String(order.order_status || order.status || 'pending');
+  if (['cancelled', 'canceled', 'rejected', 'refunded', 'charged_back', 'expired'].includes(purchase.mercadoPagoStatus)) purchase.status = 'cancelled';
+  purchase.paymentLastCheckedAt = new Date();
+  await purchase.save();
+  return purchase;
+}
+
+async function processMercadoPagoMerchantOrder(orderId, source) {
+  const credentials = mercadoPagoCheckoutCredentials();
+  const order = await mercadoPagoRequest(
+    `/merchant_orders/${encodeURIComponent(orderId)}`,
+    {},
+    credentials.accessToken,
+    credentials.accessTokenVariable
+  );
+  return applyMercadoPagoMerchantOrder(order, source);
+}
+
+async function syncMercadoPagoCheckout(purchase) {
+  if (purchase.status === 'paid') return purchase;
+  if (purchase.mercadoPagoPaymentId) {
+    return processMercadoPagoCheckoutPayment(purchase.mercadoPagoPaymentId, 'consulta-checkout-pro');
+  }
+  if (!purchase.mercadoPagoPreferenceId) return purchase;
+  const credentials = mercadoPagoCheckoutCredentials();
+  const result = await mercadoPagoRequest(
+    `/merchant_orders?preference_id=${encodeURIComponent(purchase.mercadoPagoPreferenceId)}`,
+    {},
+    credentials.accessToken,
+    credentials.accessTokenVariable
+  );
+  const orders = Array.isArray(result.elements) ? result.elements : [];
+  const order = orders.find((item) => String(item.external_reference || '') === purchase.orderCode) || orders[0];
+  if (order) return applyMercadoPagoMerchantOrder(order, 'consulta-checkout-pro');
+  purchase.paymentLastCheckedAt = new Date();
+  await purchase.save();
   return purchase;
 }
 
@@ -957,20 +1198,29 @@ async function processMercadoPagoOrderWebhook(orderId) {
   }
 }
 
-app.get('/health', (req, res) => res.json({ ok: true, service: 'zapdisparo-license-server', paymentEnvironment: PAYMENT_ENVIRONMENT }));
+app.get('/health', (req, res) => res.json({ ok: true, service: 'zapdisparo-license-server', paymentEnvironment: PAYMENT_ENVIRONMENT, controlledPaymentTest: isControlledPaymentTest() }));
+app.get('/api/public/payment-config', publicRateLimit, (req, res) => res.json({
+  ok: true,
+  paymentEnvironment: PAYMENT_ENVIRONMENT,
+  controlledPaymentTest: isControlledPaymentTest(),
+  checkoutTestAmount: isControlledPaymentTest() ? CHECKOUT_TEST_AMOUNT_CENTS / 100 : 0
+}));
 
 app.post('/api/sales/orders', publicRateLimit, async (req, res) => {
   const body = req.body || {};
   const email = normalizeEmail(body.email);
   if (!body.name || !validEmail(email)) return res.status(400).json({ ok: false, message: 'Informe nome e e-mail válidos.' });
   const settings = planSettings(body.plan);
+  const paymentMethod = body.paymentMethod === 'mercado_pago_checkout'
+    ? 'mercado_pago_checkout'
+    : (body.paymentMethod === 'card_recurring' ? 'card_recurring' : 'pix');
   const orderToken = createOrderAccessToken();
   const purchase = await Purchase.create({
     orderCode: generateOrderCode(), name: String(body.name).trim(), email,
     phone: String(body.phone || '').trim(), cpfCnpj: String(body.cpfCnpj || '').trim(),
     plan: settings.name,
-    amount: settings.amount,
-    paymentMethod: body.paymentMethod === 'card_recurring' ? 'card_recurring' : 'pix', downloadUrl: DOWNLOAD_URL,
+    amount: paymentMethod === 'mercado_pago_checkout' ? checkoutAmountForPlan(settings.name) : settings.amount,
+    paymentMethod, downloadUrl: DOWNLOAD_URL,
     accessTokenHash: hashOrderAccessToken(orderToken)
   });
   res.status(201).json({ ok: true, message: 'Pedido criado.', orderToken, order: publicOrder(purchase) });
@@ -998,7 +1248,7 @@ app.get('/api/sales/orders/:orderCode', publicRateLimit, async (req, res) => {
   if (!requireOrderAccess(purchase, req, res)) return;
   try {
     const lastCheck = purchase.paymentLastCheckedAt ? purchase.paymentLastCheckedAt.getTime() : 0;
-    if (purchase.status === 'pending' && (purchase.mercadoPagoPaymentId || purchase.mercadoPagoOrderId) && Date.now() - lastCheck > 5000) await syncMercadoPagoPayment(purchase);
+    if (purchase.status === 'pending' && (purchase.mercadoPagoPaymentId || purchase.mercadoPagoOrderId || purchase.mercadoPagoPreferenceId) && Date.now() - lastCheck > 5000) await syncMercadoPagoPayment(purchase);
   } catch (error) { console.error('Falha ao consultar pagamento:', error.message); }
   res.json({ ok: true, order: publicOrder(purchase) });
 });
@@ -1009,6 +1259,43 @@ app.post('/api/payments/mercadopago/subscription/create', publicRateLimit, async
   if (purchase.checkoutUrl) return res.json({ ok: true, order: publicOrder(purchase) });
   await createMercadoPagoSubscription(purchase);
   res.json({ ok: true, message: 'Assinatura criada. Finalize o cadastro do cartão no Mercado Pago.', order: publicOrder(purchase) });
+});
+
+app.post('/api/payments/mercadopago/checkout/create', publicRateLimit, async (req, res) => {
+  const purchase = await Purchase.findOne({ orderCode: String(req.body?.orderCode || '').trim() }).select('+accessTokenHash');
+  if (!purchase) return res.status(404).json({ ok: false, message: 'Pedido não encontrado.' });
+  if (!requireOrderAccess(purchase, req, res)) return;
+  if (purchase.status === 'paid') return res.json({ ok: true, order: publicOrder(purchase) });
+  if (purchase.paymentMethod !== 'mercado_pago_checkout') return res.status(409).json({ ok: false, message: 'Este pedido não pertence ao Checkout Pro.' });
+  if (!purchase.checkoutUrl) await createMercadoPagoCheckout(purchase);
+  res.json({ ok: true, message: 'Checkout criado. Finalize o pagamento no Mercado Pago.', order: publicOrder(purchase) });
+});
+
+app.post('/api/payments/mercadopago/checkout/webhook', async (req, res) => {
+  try {
+    const dataId = String(req.query['data.id'] || req.body?.data?.id || '');
+    const type = String(req.query.type || req.body?.type || '').toLowerCase();
+    const credentials = mercadoPagoCheckoutCredentials();
+    if (!credentials.webhookSecret || !validateMercadoPagoSignature(req, dataId, credentials.webhookSecret)) {
+      throw new Error(`${credentials.webhookSecretVariable} inválida ou não configurada.`);
+    }
+    res.status(200).json({ ok: true });
+    if (type && !['payment', 'payments', 'merchant_order'].includes(type)) return;
+    setImmediate(async () => {
+      try {
+        if (type === 'merchant_order') {
+          await processMercadoPagoMerchantOrder(dataId, 'webhook-checkout-pro-merchant-order');
+          return;
+        }
+        await processMercadoPagoCheckoutPayment(dataId, 'webhook-checkout-pro');
+      } catch (error) {
+        console.error('Erro ao processar webhook Checkout Pro:', error.message);
+      }
+    });
+  } catch (error) {
+    console.error('Webhook Checkout Pro rejeitado:', error.message);
+    res.status(401).json({ ok: false, message: 'Assinatura de webhook inválida.' });
+  }
 });
 
 app.post('/api/payments/mercadopago/webhook', async (req, res) => {
@@ -1563,5 +1850,10 @@ module.exports = {
   mercadoPagoOrderStatus,
   mercadoPagoOrderAmount,
   selectMercadoPagoSubscriptionCredentials,
-  validateMercadoPagoSignature
+  validateMercadoPagoSignature,
+  validatePaymentTestConfiguration,
+  checkoutAmountForPlan,
+  mercadoPagoCheckoutCredentials,
+  checkoutBackUrls,
+  mercadoPagoCheckoutPayload
 };
