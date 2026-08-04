@@ -25,12 +25,15 @@ const EMAIL_LOGO_URL = process.env.EMAIL_LOGO_URL || '';
 const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || process.env.SMTP_USER || '';
 const SALES_ORIGIN = process.env.SALES_ORIGIN || '*';
 const MERCADO_PAGO_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN || '';
+const MERCADO_PAGO_SUBSCRIPTION_ACCESS_TOKEN = process.env.MERCADO_PAGO_SUBSCRIPTION_ACCESS_TOKEN || '';
 const MERCADO_PAGO_WEBHOOK_SECRET = process.env.MERCADO_PAGO_WEBHOOK_SECRET || '';
+const MERCADO_PAGO_SUBSCRIPTION_WEBHOOK_SECRET = process.env.MERCADO_PAGO_SUBSCRIPTION_WEBHOOK_SECRET || '';
 const MERCADO_PAGO_WEBHOOK_URL = process.env.MERCADO_PAGO_WEBHOOK_URL || 'https://zapdisparo-license-server.onrender.com/api/payments/mercadopago/webhook';
 const MERCADO_PAGO_SUBSCRIPTION_BACK_URL = process.env.MERCADO_PAGO_SUBSCRIPTION_BACK_URL || 'https://seusite.com/sales.html';
 const PAYMENT_ENVIRONMENT = String(process.env.PAYMENT_ENVIRONMENT || 'production').trim().toLowerCase() === 'sandbox' ? 'sandbox' : 'production';
 const MERCADO_PAGO_SANDBOX_PAYER_EMAIL = process.env.MERCADO_PAGO_SANDBOX_PAYER_EMAIL || 'test_user_br@testuser.com';
 const MERCADO_PAGO_SANDBOX_APPROVAL_NAME = process.env.MERCADO_PAGO_SANDBOX_APPROVAL_NAME || 'APRO';
+const MERCADO_PAGO_SANDBOX_SUBSCRIPTION_PAYER_EMAIL = process.env.MERCADO_PAGO_SANDBOX_SUBSCRIPTION_PAYER_EMAIL || 'test@testuser.com';
 const LICENSE_REMINDER_HOUR = Math.min(23, Math.max(0, Number(process.env.LICENSE_REMINDER_HOUR || 8)));
 const LICENSE_REMINDER_MINUTE = Math.min(59, Math.max(0, Number(process.env.LICENSE_REMINDER_MINUTE || 0)));
 const LICENSE_SIGNING_SECRET = process.env.LICENSE_SIGNING_SECRET || '';
@@ -516,8 +519,8 @@ function scheduleLicenseReminderJob() {
   if (typeof timer.unref === 'function') timer.unref();
 }
 
-function validateMercadoPagoSignature(req, dataId) {
-  if (!MERCADO_PAGO_WEBHOOK_SECRET) return true;
+function validateMercadoPagoSignature(req, dataId, secret = MERCADO_PAGO_WEBHOOK_SECRET) {
+  if (!secret) return true;
   const signature = String(req.headers['x-signature'] || '');
   const requestId = String(req.headers['x-request-id'] || '');
   const parts = Object.fromEntries(signature.split(',').map((item) => item.trim().split('=')));
@@ -525,10 +528,51 @@ function validateMercadoPagoSignature(req, dataId) {
   const timestampSeconds = Number(parts.ts);
   if (!Number.isFinite(timestampSeconds) || Math.abs(Date.now() - timestampSeconds * 1000) > 5 * 60 * 1000) return false;
   const manifest = `id:${String(dataId).toLowerCase()};request-id:${requestId};ts:${parts.ts};`;
-  const expected = crypto.createHmac('sha256', MERCADO_PAGO_WEBHOOK_SECRET).update(manifest).digest('hex');
+  const expected = crypto.createHmac('sha256', secret).update(manifest).digest('hex');
   const a = Buffer.from(expected, 'utf8');
   const b = Buffer.from(String(parts.v1), 'utf8');
   return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function selectMercadoPagoSubscriptionCredentials({
+  paymentEnvironment = PAYMENT_ENVIRONMENT,
+  purchaseEmail = '',
+  accessToken = MERCADO_PAGO_ACCESS_TOKEN,
+  subscriptionAccessToken = MERCADO_PAGO_SUBSCRIPTION_ACCESS_TOKEN,
+  sandboxPayerEmail = MERCADO_PAGO_SANDBOX_SUBSCRIPTION_PAYER_EMAIL
+} = {}) {
+  if (paymentEnvironment === 'sandbox') {
+    return {
+      accessToken: subscriptionAccessToken,
+      accessTokenVariable: 'MERCADO_PAGO_SUBSCRIPTION_ACCESS_TOKEN',
+      payerEmail: sandboxPayerEmail
+    };
+  }
+  return {
+    accessToken,
+    accessTokenVariable: 'MERCADO_PAGO_ACCESS_TOKEN',
+    payerEmail: purchaseEmail
+  };
+}
+
+function mercadoPagoWebhookCredential(req, dataId) {
+  const credentials = [{
+    source: 'payments',
+    secret: MERCADO_PAGO_WEBHOOK_SECRET,
+    accessToken: MERCADO_PAGO_ACCESS_TOKEN,
+    accessTokenVariable: 'MERCADO_PAGO_ACCESS_TOKEN'
+  }];
+  if (PAYMENT_ENVIRONMENT === 'sandbox') {
+    credentials.push({
+      source: 'subscription',
+      secret: MERCADO_PAGO_SUBSCRIPTION_WEBHOOK_SECRET,
+      accessToken: MERCADO_PAGO_SUBSCRIPTION_ACCESS_TOKEN,
+      accessTokenVariable: 'MERCADO_PAGO_SUBSCRIPTION_ACCESS_TOKEN'
+    });
+  }
+  const configured = credentials.filter((credential) => credential.secret);
+  if (!configured.length) return credentials[0];
+  return configured.find((credential) => validateMercadoPagoSignature(req, dataId, credential.secret)) || null;
 }
 
 function createOrderAccessToken() {
@@ -578,12 +622,12 @@ function publicOrder(purchase) {
     subscriptionId: purchase.mercadoPagoSubscriptionId || undefined
   };
 }
-async function mercadoPagoRequest(path, options = {}) {
-  if (!MERCADO_PAGO_ACCESS_TOKEN) throw new Error('MERCADO_PAGO_ACCESS_TOKEN não configurado.');
+async function mercadoPagoRequest(path, options = {}, accessToken = MERCADO_PAGO_ACCESS_TOKEN, accessTokenVariable = 'MERCADO_PAGO_ACCESS_TOKEN') {
+  if (!accessToken) throw new Error(`${accessTokenVariable} não configurado.`);
   const response = await fetch(`https://api.mercadopago.com${path}`, {
     ...options,
     headers: {
-      Authorization: `Bearer ${MERCADO_PAGO_ACCESS_TOKEN}`,
+      Authorization: `Bearer ${accessToken}`,
       'Content-Type': 'application/json',
       ...(options.headers || {})
     }
@@ -697,10 +741,11 @@ async function createMercadoPagoPix(purchase) {
   return payment;
 }
 async function createMercadoPagoSubscription(purchase) {
+  const credentials = selectMercadoPagoSubscriptionCredentials({ purchaseEmail: purchase.email });
   const payload = {
     reason: `Licença mensal ZapDisparo - ${purchase.email}`,
     external_reference: purchase.orderCode,
-    payer_email: purchase.email,
+    payer_email: credentials.payerEmail,
     back_url: MERCADO_PAGO_SUBSCRIPTION_BACK_URL,
     notification_url: MERCADO_PAGO_WEBHOOK_URL,
     status: 'pending',
@@ -715,7 +760,7 @@ async function createMercadoPagoSubscription(purchase) {
     method: 'POST',
     headers: { 'X-Idempotency-Key': `zap-sub-${purchase.orderCode}` },
     body: JSON.stringify(payload)
-  });
+  }, credentials.accessToken, credentials.accessTokenVariable);
   purchase.paymentMethod = 'card_recurring';
   purchase.mercadoPagoSubscriptionId = String(subscription.id || '');
   purchase.mercadoPagoSubscriptionStatus = subscription.status || 'pending';
@@ -970,9 +1015,8 @@ app.post('/api/payments/mercadopago/webhook', async (req, res) => {
   try {
     const dataId = String(req.query['data.id'] || req.body?.data?.id || '');
     const type = String(req.query.type || req.body?.type || '').toLowerCase();
-    if (MERCADO_PAGO_WEBHOOK_SECRET) {
-      if (!validateMercadoPagoSignature(req, dataId)) throw new Error('Assinatura inválida.');
-    }
+    const webhookCredential = mercadoPagoWebhookCredential(req, dataId);
+    if (!webhookCredential) throw new Error('Assinatura inválida.');
     res.status(200).json({ ok: true });
     if (type && !['payment', 'order', 'orders'].includes(type)) return;
     setImmediate(async () => {
@@ -981,7 +1025,12 @@ app.post('/api/payments/mercadopago/webhook', async (req, res) => {
           await processMercadoPagoOrderWebhook(dataId);
           return;
         }
-        const payment = await mercadoPagoRequest(`/v1/payments/${encodeURIComponent(dataId)}`);
+        const payment = await mercadoPagoRequest(
+          `/v1/payments/${encodeURIComponent(dataId)}`,
+          {},
+          webhookCredential.accessToken,
+          webhookCredential.accessTokenVariable
+        );
         const subscriptionId = String(payment.subscription_id || payment.preapproval_id || payment.metadata?.subscription_id || '');
         let purchase = await Purchase.findOne({ $or: [{ mercadoPagoPaymentId: String(payment.id) }, { orderCode: String(payment.external_reference || '') }, ...(subscriptionId ? [{ mercadoPagoSubscriptionId: subscriptionId }] : [])] });
         // Somente PIX dinâmico com external_reference exclusivo é aceito.
@@ -1512,5 +1561,7 @@ module.exports = {
   sandboxPixOrderPayload,
   mercadoPagoOrderPayment,
   mercadoPagoOrderStatus,
-  mercadoPagoOrderAmount
+  mercadoPagoOrderAmount,
+  selectMercadoPagoSubscriptionCredentials,
+  validateMercadoPagoSignature
 };
