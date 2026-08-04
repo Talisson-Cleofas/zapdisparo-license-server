@@ -17,6 +17,7 @@ npm run dev
 - Build command: `npm install`
 - Start command: `npm start`
 - Variáveis: `MONGODB_URI` e `ADMIN_KEY`
+- Página pública de vendas: `/sales.html` (a raiz `/` direciona para a mesma página)
 
 ## Criar licença
 
